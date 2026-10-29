@@ -2,6 +2,7 @@
 """HTML 폼과 Supabase PostgreSQL로 만드는 작은 방명록."""
 
 import json
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from html import escape
@@ -34,25 +35,80 @@ TEMPLATE = (
 # --------------------------------------------------
 
 def load_config(config_path: Path = CONFIG_PATH) -> dict:
-    """config.json에서 PostgreSQL 접속 정보를 읽습니다."""
+    """
+    Render에서는 환경변수로 DB 접속 정보를 읽고,
+    로컬에서는 config.json을 사용합니다.
+    """
 
-    with config_path.open("r", encoding="utf-8") as file:
-        config = json.load(file)
+    env_names = {
+        "host": "DB_HOST",
+        "port": "DB_PORT",
+        "dbname": "DB_NAME",
+        "user": "DB_USER",
+        "password": "DB_PASSWORD",
+    }
+
+    is_render = os.getenv("RENDER", "").lower() == "true"
+    has_db_env = any(
+        os.getenv(name) is not None
+        for name in env_names.values()
+    )
+
+    if is_render or has_db_env:
+        missing = [
+            env_name
+            for env_name in env_names.values()
+            if not os.getenv(env_name, "").strip()
+        ]
+
+        if missing:
+            raise ValueError(
+                "필수 데이터베이스 환경변수가 누락되었습니다: "
+                + ", ".join(missing)
+            )
+
+        config = {
+            key: os.environ[env_name]
+            for key, env_name in env_names.items()
+        }
+
+    else:
+        # 로컬 개발 환경에서만 config.json 사용
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"설정 파일을 찾을 수 없습니다: {config_path}"
+            )
+
+        with config_path.open("r", encoding="utf-8") as file:
+            config = json.load(file)
 
     required = ("host", "port", "dbname", "user", "password")
 
-    if any(not config.get(key) for key in required):
+    if any(
+        key not in config
+        or config[key] is None
+        or not str(config[key]).strip()
+        for key in required
+    ):
         raise ValueError(
-            "config.json에 host, port, dbname, user, password를 "
-            "모두 설정해야 합니다."
+            "DB 접속 정보에 host, port, dbname, user, password가 "
+            "모두 필요합니다."
         )
 
+    try:
+        port = int(config["port"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("DB 포트는 정수여야 합니다.") from exc
+
+    if not 1 <= port <= 65535:
+        raise ValueError("DB 포트는 1~65535 범위여야 합니다.")
+
     return {
-        "host": config["host"],
-        "port": int(config["port"]),
-        "dbname": config["dbname"],
-        "user": config["user"],
-        "password": config["password"],
+        "host": str(config["host"]).strip(),
+        "port": port,
+        "dbname": str(config["dbname"]).strip(),
+        "user": str(config["user"]).strip(),
+        "password": str(config["password"]),
         "sslmode": "require",
         "connect_timeout": 10,
         "row_factory": dict_row,
@@ -217,7 +273,7 @@ def save_entry(db_config: dict, entry: EntryInput) -> bool:
     """글 수 제한을 확인하고 방명록을 저장합니다."""
 
     with connect(db_config) as connection:
-        # 동시 요청에서 최대 글 수 제한이 초과되지 않도록
+        # 동시에 여러 글이 저장될 때 글 수 제한을 초과하지 않도록
         # 테이블 쓰기 작업을 직렬화합니다.
         connection.execute(
             "LOCK TABLE public.entries IN EXCLUSIVE MODE"
@@ -277,7 +333,7 @@ def submit_entry(db_config: dict, body: bytes):
             message=message,
         )
 
-    except (ValueError, ValidationError):
+    except (ValueError, UnicodeDecodeError, ValidationError):
         return render_page(
             db_config,
             error=(
@@ -310,7 +366,11 @@ def submit_entry(db_config: dict, body: bytes):
 # --------------------------------------------------
 
 def create_app(config_path: Path | None = None):
-    path = Path(config_path) if config_path is not None else CONFIG_PATH
+    path = (
+        Path(config_path)
+        if config_path is not None
+        else CONFIG_PATH
+    )
 
     db_config = load_config(path)
 
